@@ -8,6 +8,7 @@ const authRoutes = require("./routes/auth");
 const providerRoutes = require("./routes/providers");
 const requestRoutes = require("./routes/requests");
 const webhookRoutes = require("./routes/webhooks");
+const adminRoutes = require("./routes/admin");
 
 const app = express();
 
@@ -15,8 +16,7 @@ app.use(helmet());
 
 app.use(
   cors({
-    origin: process.env.ALLOWED_ORIGIN, // never '*' — lock to the real frontend domain(s)
-    credentials: true,
+    origin: process.env.ALLOWED_ORIGIN, // set this to your real website address, e.g. https://your-site.netlify.app
   })
 );
 
@@ -39,6 +39,7 @@ app.use(
 app.use("/auth", authRoutes);
 app.use("/providers", providerRoutes);
 app.use("/requests", requestRoutes);
+app.use("/admin", adminRoutes);
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
