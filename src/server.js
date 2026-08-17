@@ -24,7 +24,7 @@ app.use(
 // or Stripe's signature check will fail against an already-parsed body.
 app.use("/webhooks", express.raw({ type: "application/json" }), webhookRoutes);
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "6mb" }));
 
 // Global rate limit as a floor; auth routes have their own tighter limit.
 app.use(
