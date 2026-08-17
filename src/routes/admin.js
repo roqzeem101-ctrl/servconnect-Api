@@ -1,165 +1,151 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
-const crypto = require("crypto");
-const rateLimit = require("express-rate-limit");
-const { z } = require("zod");
-const { query } = require("../db");
-const { sendEmail, verificationEmailHtml } = require("../utils/email");
+const { query, withTransaction } = require("../db");
 
 const router = express.Router();
-const BCRYPT_ROUNDS = 12;
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many attempts. Try again later." },
-});
+const CATEGORY_NAMES = ["Plumbing", "Electrical", "Cleaning", "Tutoring", "Fitness", "Pet Care", "Photography", "Handyman"];
 
-const signupSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(8),
-  role: z.enum(["customer", "provider"]),
-  displayName: z.string().min(1).optional(),
-});
+// Base location the demo providers are scattered around (Toronto, ON).
+// Change these two numbers if you'd rather center it on your own city.
+const BASE_LAT = 43.6532;
+const BASE_LNG = -79.3832;
 
-function issueTokens(user) {
-  const accessToken = jwt.sign(
-    { sub: user.id, role: user.role },
-    process.env.JWT_ACCESS_SECRET,
-    { expiresIn: process.env.JWT_ACCESS_TTL || "15m" }
-  );
-  const refreshToken = jwt.sign(
-    { sub: user.id, tokenType: "refresh" },
-    process.env.JWT_REFRESH_SECRET,
-    { expiresIn: process.env.JWT_REFRESH_TTL || "30d" }
-  );
-  return { accessToken, refreshToken };
-}
+const DEMO_PROVIDERS = [
+  { name: "Marisol Reyes", category: "Plumbing", price: 65, latOffset: 0.01, lngOffset: 0.01 },
+  { name: "Delroy Fenton", category: "Electrical", price: 90, latOffset: 0.03, lngOffset: -0.02 },
+  { name: "Priya Nadarajah", category: "Cleaning", price: 40, latOffset: -0.02, lngOffset: 0.015 },
+  { name: "Owen Baptiste", category: "Tutoring", price: 30, latOffset: 0.045, lngOffset: 0.03 },
+  { name: "Fatima Al-Sayed", category: "Fitness", price: 55, latOffset: -0.007, lngOffset: -0.005 },
+  { name: "Colton Vasquez", category: "Pet Care", price: 22, latOffset: 0.038, lngOffset: -0.025 },
+  { name: "Nina Okonkwo", category: "Photography", price: 150, latOffset: -0.055, lngOffset: 0.04 },
+  { name: "Hank Dubois", category: "Handyman", price: 48, latOffset: 0.02, lngOffset: -0.015 },
+];
 
-router.post("/signup", authLimiter, async (req, res) => {
-  const parsed = signupSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() });
-  }
-  const { email, password, role, displayName } = parsed.data;
-
-  const existing = await query("SELECT id FROM users WHERE email = $1", [email]);
-  if (existing.rows.length > 0) {
-    return res.status(400).json({ error: "Could not create account" });
+// Visit this URL once (with the correct key) to stock the database with
+// starter categories and demo providers. Safe to run more than once —
+// it skips anything that already exists instead of duplicating it.
+router.get("/seed", async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_SEED_KEY) {
+    return res.status(403).json({ error: "Invalid seed key" });
   }
 
-  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-
-  const { rows } = await query(
-    `INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role`,
-    [email, passwordHash, role]
-  );
-  const user = rows[0];
-
-  if (role === "provider") {
-    await query(
-      `INSERT INTO provider_profiles (user_id, display_name, verification_status)
-       VALUES ($1, $2, 'pending')`,
-      [user.id, displayName || email.split("@")[0]]
-    );
-  }
-
-  // Account works immediately -- email verification is tracked separately
-  // rather than blocking login, so a slow/failed email never locks anyone out.
-  const verifyToken = crypto.randomBytes(32).toString("hex");
-  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000);
-  await query(
-    `UPDATE users SET email_verify_token = $1, email_verify_expires = $2 WHERE id = $3`,
-    [verifyToken, expires, user.id]
-  );
-
-  const verifyUrl = `${process.env.API_PUBLIC_URL}/auth/verify-email?token=${verifyToken}`;
   try {
-    await sendEmail({
-      to: email,
-      subject: "Verify your ServConnect email",
-      html: verificationEmailHtml({ name: displayName || email, verifyUrl }),
+    const result = await withTransaction(async (client) => {
+      const categoryIds = {};
+      for (const name of CATEGORY_NAMES) {
+        const existing = await client.query("SELECT id FROM service_categories WHERE name = $1", [name]);
+        if (existing.rows.length > 0) {
+          categoryIds[name] = existing.rows[0].id;
+        } else {
+          const inserted = await client.query(
+            "INSERT INTO service_categories (name) VALUES ($1) RETURNING id",
+            [name]
+          );
+          categoryIds[name] = inserted.rows[0].id;
+        }
+      }
+
+      let created = 0;
+      for (const p of DEMO_PROVIDERS) {
+        const email = `${p.name.toLowerCase().replace(/\s+/g, ".")}@demo.servconnect`;
+        const existingUser = await client.query("SELECT id FROM users WHERE email = $1", [email]);
+        if (existingUser.rows.length > 0) continue; // already seeded
+
+        const passwordHash = await bcrypt.hash(`demo-${Date.now()}-${Math.random()}`, 10);
+        const userResult = await client.query(
+          `INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'provider') RETURNING id`,
+          [email, passwordHash]
+        );
+        const userId = userResult.rows[0].id;
+
+        await client.query(
+          `INSERT INTO provider_profiles
+             (user_id, display_name, verification_status, base_lat, base_lng, live_lat, live_lng, available_now, avg_rating, completed_jobs)
+           VALUES ($1, $2, 'verified', $3, $4, $3, $4, true, 4.8, 120)`,
+          [userId, p.name, BASE_LAT + p.latOffset, BASE_LNG + p.lngOffset]
+        );
+
+        await client.query(
+          `INSERT INTO provider_services (provider_id, category_id, price_type, price)
+           VALUES ($1, $2, 'fixed', $3)`,
+          [userId, categoryIds[p.category], p.price]
+        );
+
+        created += 1;
+      }
+
+      return { categoriesReady: CATEGORY_NAMES.length, providersCreated: created };
     });
+
+    res.json({ ok: true, ...result });
   } catch (err) {
-    console.error("Verification email failed to send:", err.message);
+    console.error(err);
+    res.status(500).json({ error: "Seeding failed", detail: err.message });
   }
-
-  const tokens = issueTokens(user);
-  res.status(201).json({ user, ...tokens });
 });
 
-router.post("/login", authLimiter, async (req, res) => {
-  const schema = z.object({ email: z.string().email(), password: z.string() });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Invalid credentials" });
-
-  const { email, password } = parsed.data;
-  const { rows } = await query(
-    "SELECT id, email, role, password_hash, email_verified FROM users WHERE email = $1",
-    [email]
-  );
-  const user = rows[0];
-  const hashToCompare = user ? user.password_hash : "$2b$12$invalidsaltinvalidsaltinvalidsaltu";
-  const valid = await bcrypt.compare(password, hashToCompare);
-
-  if (!user || !valid) {
-    return res.status(401).json({ error: "Invalid email or password" });
-  }
-
-  const tokens = issueTokens(user);
-  res.json({
-    user: { id: user.id, email: user.email, role: user.role, emailVerified: user.email_verified },
-    ...tokens,
-  });
+// Handy for the frontend to look up category IDs by name.
+router.get("/categories", async (req, res) => {
+  const { rows } = await query("SELECT id, name FROM service_categories ORDER BY name");
+  res.json({ categories: rows });
 });
 
-// Visited by clicking the link in the verification email -- no login needed.
-router.get("/verify-email", async (req, res) => {
-  const token = req.query.token;
-  if (!token) return res.status(400).send("Missing verification token.");
-
-  const { rows } = await query(
-    `SELECT id FROM users WHERE email_verify_token = $1 AND email_verify_expires > now()`,
-    [token]
-  );
-  if (rows.length === 0) {
-    return res.status(400).send("This verification link is invalid or has expired.");
+// One-time: adds the columns email verification needs. Safe to visit more
+// than once — "IF NOT EXISTS" means it skips anything already added.
+router.get("/migrate-email-verification", async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_SEED_KEY) {
+    return res.status(403).json({ error: "Invalid seed key" });
   }
-
-  await query(
-    `UPDATE users SET email_verified = true, email_verify_token = NULL, email_verify_expires = NULL WHERE id = $1`,
-    [rows[0].id]
-  );
-
-  res.send(`
-    <div style="font-family: sans-serif; text-align:center; padding: 60px 20px;">
-      <h2>Email verified ✅</h2>
-      <p>You can close this tab and go back to ServConnect.</p>
-    </div>
-  `);
-});
-
-router.post("/refresh", authLimiter, async (req, res) => {
-  const { refreshToken } = req.body || {};
-  if (!refreshToken) return res.status(400).json({ error: "Missing refresh token" });
-
   try {
-    const payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-    const { rows } = await query("SELECT id, role FROM users WHERE id = $1", [payload.sub]);
-    if (rows.length === 0) return res.status(401).json({ error: "Invalid token" });
-
-    const accessToken = jwt.sign(
-      { sub: rows[0].id, role: rows[0].role },
-      process.env.JWT_ACCESS_SECRET,
-      { expiresIn: process.env.JWT_ACCESS_TTL || "15m" }
-    );
-    res.json({ accessToken });
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_token TEXT`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_expires TIMESTAMPTZ`);
+    res.json({ ok: true });
   } catch (err) {
-    res.status(401).json({ error: "Invalid or expired refresh token" });
+    res.status(500).json({ error: err.message });
   }
 });
 
+// Visit this URL once (with the correct key) to add the database changes
+// needed for email verification codes. Safe to run more than once.
+router.get("/apply-otp-schema", async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_SEED_KEY) {
+    return res.status(403).json({ error: "Invalid seed key" });
+  }
+  try {
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ`);
+    await query(`
+      CREATE TABLE IF NOT EXISTS otp_codes (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        email TEXT NOT NULL,
+        code TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_otp_email_purpose ON otp_codes (email, purpose)`);
+    res.json({ ok: true, message: "Email verification tables are ready." });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Schema update failed", detail: err.message });
+  }
+});
+// One-time: adds the columns email verification needs. Safe to visit more
+// than once — "IF NOT EXISTS" means it skips anything already added.
+router.get("/migrate-email-verification", async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_SEED_KEY) {
+    return res.status(403).json({ error: "Invalid seed key" });
+  }
+  try {
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_token TEXT`);
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_expires TIMESTAMPTZ`);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 module.exports = router;
