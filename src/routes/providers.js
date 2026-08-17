@@ -1,10 +1,41 @@
 const express = require("express");
 const { z } = require("zod");
 const { query } = require("../db");
-const { requireAuth } = require("../middleware/auth");
+const { requireAuth, requireRole } = require("../middleware/auth");
 const { haversineKm, scoreProvider } = require("../utils/matching");
 
 const router = express.Router();
+
+const verificationSchema = z.object({
+  docBase64: z.string().min(100), // the ID photo, encoded as text
+  docFilename: z.string().min(1),
+  consent: z.literal(true),
+});
+
+// POST /providers/verification — a provider submits their ID for review.
+// Stored as-is for now (see note in the deploy guide about moving this
+// to real file storage before handling real users' documents at scale).
+router.post("/verification", requireAuth, requireRole("provider"), async (req, res) => {
+  const parsed = verificationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Missing ID upload or consent" });
+
+  await query(
+    `UPDATE provider_profiles
+     SET verification_docs = $1, verification_status = 'pending'
+     WHERE user_id = $2`,
+    [
+      JSON.stringify({
+        filename: parsed.data.docFilename,
+        uploadedAt: new Date().toISOString(),
+        consent: true,
+        data: parsed.data.docBase64,
+      }),
+      req.user.id,
+    ]
+  );
+
+  res.json({ ok: true, status: "pending" });
+});
 
 const searchSchema = z.object({
   lat: z.coerce.number(),
